@@ -19,80 +19,102 @@ import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.Topology;
+import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.KTable;
+import org.apache.kafka.streams.kstream.Named;
 import org.apache.kafka.streams.kstream.Materialized;
-import org.apache.kafka.streams.kstream.Produced;
 
 public class KStreamsToKTable {
+    private static final String BOOTSTRAP_SERVERS = "bootstrap.servers";
+    private static final Serde<String> STRING_SER_DE = Serdes.String();
 
-
-	public Properties buildStreamsProperties(Properties envProps) {
+	private static Properties buildStreamsProperties(Properties envProps) {
         Properties props = new Properties();
 
         props.put(StreamsConfig.APPLICATION_ID_CONFIG, envProps.getProperty("application.id"));
-        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, envProps.getProperty("bootstrap.servers"));
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, envProps.getProperty(BOOTSTRAP_SERVERS));
 
         // default SerDe for key and valueß
-        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
-        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, STRING_SER_DE.getClass());
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, STRING_SER_DE.getClass());
 
         return props;
     }
 
-    public Topology buildTopology(Properties envProps) {
+    private static Topology buildTopology(Properties envProps) {
         final StreamsBuilder builder = new StreamsBuilder();
         final String inputTopic = envProps.getProperty("input.topic.name");
         final String streamsOutputTopic = envProps.getProperty("streams.output.topic.name");
         final String tableOutputTopic = envProps.getProperty("table.output.topic.name");
+        final String filteredTableOutputTopic = envProps.getProperty("filtered.table.output.topic.name");
 
-        final Serde<String> stringSerde = Serdes.String();
-
-        Consumed consumerConf = Consumed.with(stringSerde, stringSerde).withOffsetResetPolicy(EARLIEST);
+        // auto.offset.reset=earliest
+        Consumed<String, String> consumerConf = Consumed.with(STRING_SER_DE, STRING_SER_DE).withOffsetResetPolicy(EARLIEST);
         final KStream<String, String> stream = builder.stream(inputTopic, consumerConf);
 
-        final KTable<String, String> convertedTable = stream.toTable(Materialized.as("stream-converted-to-table"));
+        final KTable<String, String> convertedTable = stream.toTable(
+            Named.as("my-ktable"),
+            Materialized.as("stream-converted-to-table")
+        );
+        // Dummy way to peek into table
+        convertedTable.mapValues((k,v) -> System.err.printf("[KTABLE-WATCH] Key: %s, Value: %s %n", k, v));
 
-        stream.to(streamsOutputTopic, Produced.with(stringSerde, stringSerde));
-        convertedTable.toStream().to(tableOutputTopic, Produced.with(stringSerde, stringSerde));
+        final KTable<String, String> filteredTable = convertedTable.filter(
+            ((k,v) -> k.equalsIgnoreCase(v)),
+            Named.as("my-filtered-ktable"),
+            Materialized.as("filtered-table-where-key-eq-value")
+        );
 
+        Produced<String, String> producerConf = Produced.with(STRING_SER_DE, STRING_SER_DE);
+
+        stream.to(streamsOutputTopic, producerConf);
+        convertedTable.toStream().to(tableOutputTopic, producerConf);
+        filteredTable.toStream().to(filteredTableOutputTopic, producerConf);
 
         return builder.build();
     }
 
 
-    public void createTopics(final Properties envProps) {
+    private static void createTopics(final Properties envProps) {
         final Map<String, Object> config = new HashMap<>();
-        config.put("bootstrap.servers", envProps.getProperty("bootstrap.servers"));
+        config.put(BOOTSTRAP_SERVERS, envProps.getProperty(BOOTSTRAP_SERVERS));
         try (final AdminClient client = AdminClient.create(config)) {
 
-        final List<NewTopic> topics = new ArrayList<>();
+            final Integer partitions = Integer.parseInt(envProps.getProperty("topic.partitions"));
+            final Short replicationFactor = Short.parseShort(envProps.getProperty("topic.replication.factor"));
+            final List<NewTopic> topics = new ArrayList<>();
 
             topics.add(new NewTopic(
-                    envProps.getProperty("input.topic.name"),
-                    Integer.parseInt(envProps.getProperty("input.topic.partitions")),
-                    Short.parseShort(envProps.getProperty("input.topic.replication.factor"))));
+                envProps.getProperty("input.topic.name"),
+                partitions,
+                replicationFactor));
 
             topics.add(new NewTopic(
-                    envProps.getProperty("streams.output.topic.name"),
-                    Integer.parseInt(envProps.getProperty("streams.output.topic.partitions")),
-                    Short.parseShort(envProps.getProperty("streams.output.topic.replication.factor"))));
+                envProps.getProperty("streams.output.topic.name"),
+                partitions,
+                replicationFactor));
 
             topics.add(new NewTopic(
                 envProps.getProperty("table.output.topic.name"),
-                Integer.parseInt(envProps.getProperty("table.output.topic.partitions")),
-                Short.parseShort(envProps.getProperty("table.output.topic.replication.factor"))));
+                partitions,
+                replicationFactor));
+
+            topics.add(new NewTopic(
+                envProps.getProperty("filtered.table.output.topic.name"),
+                partitions,
+                replicationFactor));
 
             client.createTopics(topics);
         }
     }
 
-    public Properties loadEnvProperties(String fileName) throws IOException {
+    private static Properties loadEnvProperties(String fileName) throws IOException {
         final Properties envProps = new Properties();
-        final FileInputStream input = new FileInputStream(fileName);
-        envProps.load(input);
-        input.close();
+        try (FileInputStream input = new FileInputStream(fileName)) {
+            envProps.load(input);
+        }
 
         return envProps;
     }
@@ -104,11 +126,17 @@ public class KStreamsToKTable {
         }
 
         final KStreamsToKTable instance = new KStreamsToKTable();
-        final Properties envProps = instance.loadEnvProperties(args[0]);
-        final Properties streamProps = instance.buildStreamsProperties(envProps);
-        final Topology topology = instance.buildTopology(envProps);
+        final Properties envProps = loadEnvProperties(args[0]);
+        createTopics(envProps);
+        System.out.println("[DEBUG] Topics created...");
 
-        instance.createTopics(envProps);
+        final Properties streamProps = buildStreamsProperties(envProps);
+        final Topology topology = buildTopology(envProps);
+
+        String topologyAsStr = topology.describe().toString();
+        System.out.println("===========================");
+        System.out.println(topologyAsStr);
+        System.out.println("===========================");
 
         final KafkaStreams streams = new KafkaStreams(topology, streamProps);
         final CountDownLatch latch = new CountDownLatch(1);
@@ -127,6 +155,7 @@ public class KStreamsToKTable {
             streams.start();
             latch.await();
         } catch (Throwable e) {
+            e.printStackTrace();
             System.exit(1);
         }
         System.exit(0);
