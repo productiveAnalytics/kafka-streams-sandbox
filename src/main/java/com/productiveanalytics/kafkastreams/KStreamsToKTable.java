@@ -1,25 +1,40 @@
 package com.productiveanalytics.kafkastreams;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.apache.kafka.streams.Topology.AutoOffsetReset.EARLIEST;
 
 import java.io.FileInputStream;
 import java.io.IOException;
+
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
+
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.NewTopic;
+
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
+
 import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StoreQueryParameters;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.kstream.Produced;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.QueryableStoreTypes;
+import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
 import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.KTable;
@@ -29,6 +44,11 @@ import org.apache.kafka.streams.kstream.Materialized;
 public class KStreamsToKTable {
     private static final String BOOTSTRAP_SERVERS = "bootstrap.servers";
     private static final Serde<String> STRING_SER_DE = Serdes.String();
+
+    private static final ScheduledExecutorService SCHEDULER = Executors.newScheduledThreadPool(1);
+
+    private static KTable<String, String> myKtable;
+    private static ReadOnlyKeyValueStore<String, String> queryableStateStore;
 
 	private static Properties buildStreamsProperties(Properties envProps) {
         Properties props = new Properties();
@@ -45,6 +65,7 @@ public class KStreamsToKTable {
 
     private static Topology buildTopology(Properties envProps) {
         final StreamsBuilder builder = new StreamsBuilder();
+
         final String inputTopic = envProps.getProperty("input.topic.name");
         final String streamsOutputTopic = envProps.getProperty("streams.output.topic.name");
         final String tableOutputTopic = envProps.getProperty("table.output.topic.name");
@@ -58,11 +79,20 @@ public class KStreamsToKTable {
             Named.as("my-ktable"),
             Materialized.as("stream-converted-to-table")
         );
+        myKtable = convertedTable;
+
         // Dummy way to peek into table
         convertedTable.mapValues((k,v) -> System.err.printf("[KTABLE-WATCH] Key: %s, Value: %s %n", k, v));
 
         final KTable<String, String> filteredTable = convertedTable.filter(
-            ((k,v) -> k.equalsIgnoreCase(v)),
+            (k,v) -> {
+                if ((null != k) && (k.equalsIgnoreCase(v))) {
+                    System.out.printf("[KTABLE-FILTER] Found matching message for Key:%s %n", k);
+                    return true;
+                } else {
+                    return false;
+                }
+            },
             Named.as("my-filtered-ktable"),
             Materialized.as("filtered-table-where-key-eq-value")
         );
@@ -119,6 +149,23 @@ public class KStreamsToKTable {
         return envProps;
     }
 
+    private static <K,V> void watch(ReadOnlyKeyValueStore<K,V> view) {
+   	 final Runnable watcher = () -> {
+         System.err.println("[STATE_STORE-WATCHER] wachting ==================>");
+         KeyValueIterator<K, V> kvIter = view.all();
+         KeyValue<K, V> keyVal;
+         while (kvIter.hasNext()) {
+             keyVal = kvIter.next();
+             System.err.printf("[STATE_STORE-WATCHER] Key=%s Value=%s %n", keyVal.key, keyVal.value);
+         }
+         System.err.println("[STATE_STORE-WATCHER] watch complete >>>>>>>>>>>>>>>>>>");
+     };
+   	 
+   	 final ScheduledFuture<?> watchHandle =
+   			SCHEDULER.scheduleAtFixedRate(watcher, 10, 10, SECONDS);
+   	 		SCHEDULER.schedule(() -> watchHandle.cancel(true), 60 * 60, SECONDS);
+   }
+
     public static void main(String[] args) throws Exception {
 
         if (args.length < 1) {
@@ -153,6 +200,16 @@ public class KStreamsToKTable {
         try {
             streams.cleanUp();
             streams.start();
+
+            Objects.requireNonNull(myKtable, "Base KTable must not be void");
+            String queryableStateStoreName = myKtable.queryableStoreName();
+            System.err.println("Queryable Datastore: "+ queryableStateStoreName);
+            StoreQueryParameters<ReadOnlyKeyValueStore<String, String>> storeQuery = StoreQueryParameters.fromNameAndType(queryableStateStoreName, QueryableStoreTypes.<String, String>keyValueStore());
+            ReadOnlyKeyValueStore<String, String> qds = streams.store(storeQuery);
+            Objects.requireNonNull(qds, "Queryable State Store must not be void");
+            queryableStateStore = qds;
+            watch(queryableStateStore);
+
             latch.await();
         } catch (Throwable e) {
             e.printStackTrace();
